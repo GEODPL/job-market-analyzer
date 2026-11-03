@@ -26,6 +26,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXTRA_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap');
 html, body, [class*="st-"], .stApp { font-family: 'Inter', sans-serif; }
+span[data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"] { font-family: "Material Symbols Rounded" !important; }
 .stApp { background: radial-gradient(circle at 15% 0%, #161B27 0%, #0B0E14 45%) fixed; }
 #MainMenu, footer { visibility: hidden; }
 header[data-testid="stHeader"] { background: transparent; }
