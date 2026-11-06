@@ -1,6 +1,8 @@
 """Greek AI Job Market Analyzer - Streamlit εκδοχή για Community Cloud."""
+import hmac
 import os
 import re
+import time
 from html import escape
 from io import BytesIO
 from urllib.parse import quote_plus
@@ -12,6 +14,7 @@ import streamlit as st
 from openai import OpenAI
 from supabase import create_client
 
+from auth import AuthError, register_user, verify_user
 from docx_utils import create_docx
 from matching import match_jobs_to_cv
 from skills_config import TECH_SKILLS, aggregate_skill_demand, match_cv_skills
@@ -26,6 +29,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXTRA_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap');
 html, body, [class*="st-"], .stApp { font-family: 'Inter', sans-serif; }
+span[data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"] { font-family: "Material Symbols Rounded" !important; }
 .stApp { background: radial-gradient(circle at 15% 0%, #161B27 0%, #0B0E14 45%) fixed; }
 #MainMenu, footer { visibility: hidden; }
 header[data-testid="stHeader"] { background: transparent; }
@@ -51,9 +55,11 @@ header[data-testid="stHeader"] { background: transparent; }
 [class*="st-key-panel"] { background: #12151F; border: 1px solid #232838; border-radius: 16px; padding: 1.5rem; }
 
 /* Buttons */
-.stButton > button[kind="primary"] { background: linear-gradient(90deg, #3B82F6, #8B5CF6); color: white; border: none;
+.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] button { background: linear-gradient(90deg, #3B82F6, #8B5CF6); color: white; border: none;
   border-radius: 8px; font-weight: 600; font-size: 0.875rem; }
-.stButton > button[kind="primary"]:hover { opacity: 0.85; color: white; }
+.stButton > button[kind="primary"]:hover, [data-testid="stFormSubmitButton"] button:hover { opacity: 0.85; color: white; }
+[data-testid="stForm"] { border: none; padding: 0; }
+.user-chip { text-align: right; color: #93C5FD; font-size: 0.9rem; font-weight: 600; padding-top: 0.55rem; }
 .stButton > button[kind="secondary"], .stDownloadButton > button { background: #1B2030; color: #93C5FD; border: 1px solid #2E384D;
   border-radius: 8px; font-size: 0.82rem; font-weight: 600; }
 .stButton > button[kind="secondary"]:hover, .stDownloadButton > button:hover { border-color: #3B82F6; color: #93C5FD; }
@@ -149,18 +155,95 @@ openai_client = get_openai()
 
 
 # ------------------------------------------------------------------
-# Προαιρετικός κωδικός πρόσβασης (προστατεύει το OpenAI budget σου)
+# Σύνδεση / Εγγραφή χρηστών (username + κωδικός, πίνακας app_users)
 # ------------------------------------------------------------------
-APP_PASSWORD = get_secret("APP_PASSWORD")
-if APP_PASSWORD and not st.session_state.get("authed"):
-    st.markdown('<div class="hero"><h1 class="gradient-text">AI Job Market Analyzer</h1></div>', unsafe_allow_html=True)
-    pwd = st.text_input("Κωδικός πρόσβασης", type="password")
-    if pwd:
-        if pwd == APP_PASSWORD:
-            st.session_state["authed"] = True
-            st.rerun()
-        else:
-            st.error("Λάθος κωδικός.")
+INVITE_CODE = get_secret("INVITE_CODE")  # προαιρετικό: αν οριστεί, ζητείται για να γίνει εγγραφή
+MAX_FAILS = 5
+LOCK_SECONDS = 30
+
+
+@st.cache_resource
+def get_auth_db():
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_KEY")
+    if not (url and key):
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def login_user(username: str):
+    st.session_state["user"] = {"username": username}
+    st.session_state.pop("auth_fails", None)
+    st.session_state.pop("auth_locked_until", None)
+    st.rerun()
+
+
+def render_auth():
+    st.markdown(
+        '<div class="hero"><h1 class="gradient-text">AI Job Market Analyzer</h1>'
+        "<p>Γράψε το username σου. Αν είσαι νέος χρήστης, κάνε εγγραφή.</p></div>",
+        unsafe_allow_html=True,
+    )
+    _, mid, _ = st.columns([1, 1.6, 1])
+    with mid:
+        with st.container(key="panel_auth"):
+            db = get_auth_db()
+            if db is None:
+                st.error("Δεν έχει ρυθμιστεί το Supabase key για τους λογαριασμούς.")
+                return
+            tab_in, tab_up = st.tabs(["Σύνδεση", "Εγγραφή"])
+
+            with tab_in:
+                with st.form("login_form"):
+                    username = st.text_input("Username")
+                    pwd = st.text_input("Κωδικός", type="password")
+                    submitted = st.form_submit_button("Σύνδεση", type="primary", use_container_width=True)
+                if submitted:
+                    wait = int(st.session_state.get("auth_locked_until", 0) - time.time())
+                    if wait > 0:
+                        st.error(f"Πολλές αποτυχημένες προσπάθειες. Δοκίμασε ξανά σε {wait} δευτερόλεπτα.")
+                    elif not username or not pwd:
+                        st.error("Συμπλήρωσε username και κωδικό.")
+                    else:
+                        try:
+                            who = verify_user(db, username, pwd)
+                        except AuthError as e:
+                            st.error(str(e))
+                        else:
+                            if who:
+                                login_user(who)
+                            fails = st.session_state.get("auth_fails", 0) + 1
+                            if fails >= MAX_FAILS:
+                                st.session_state["auth_locked_until"] = time.time() + LOCK_SECONDS
+                                fails = 0
+                            st.session_state["auth_fails"] = fails
+                            st.error("Λάθος username ή κωδικός. Αν δεν έχεις λογαριασμό, πήγαινε στην Εγγραφή.")
+
+            with tab_up:
+                with st.form("signup_form"):
+                    new_user = st.text_input("Διάλεξε username", key="signup_user",
+                                             help="3-30 χαρακτήρες: μικρά λατινικά, αριθμοί, . _ -")
+                    pwd1 = st.text_input("Κωδικός (τουλάχιστον 8 χαρακτήρες)", type="password", key="signup_pwd1")
+                    pwd2 = st.text_input("Επανάληψη κωδικού", type="password", key="signup_pwd2")
+                    invite = st.text_input("Κωδικός πρόσκλησης", type="password", key="signup_invite") if INVITE_CODE else ""
+                    submitted_up = st.form_submit_button("Δημιουργία λογαριασμού", type="primary", use_container_width=True)
+                if submitted_up:
+                    if INVITE_CODE and not hmac.compare_digest(invite.encode(), INVITE_CODE.encode()):
+                        st.error("Λάθος κωδικός πρόσκλησης.")
+                    elif pwd1 != pwd2:
+                        st.error("Οι δύο κωδικοί δεν ταιριάζουν.")
+                    else:
+                        try:
+                            login_user(register_user(db, new_user, pwd1))
+                        except AuthError as e:
+                            st.error(str(e))
+
+
+if supabase and not st.session_state.get("user"):
+    render_auth()
     st.stop()
 
 
@@ -242,10 +325,19 @@ REMOTE_LABELS = {
 # ------------------------------------------------------------------
 jobs = fetch_jobs()
 
-top_l, top_r = st.columns([4, 1])
+top_l, top_u, top_r, top_o = st.columns([4, 2, 1.3, 1.3])
 top_l.markdown('<div class="brand">🚀 Job<span class="accent">Market</span>AI</div>', unsafe_allow_html=True)
+current_user = st.session_state.get("user")
+if current_user:
+    top_u.markdown(
+        f'<div class="user-chip">👤 {esc(current_user["username"])}</div>', unsafe_allow_html=True
+    )
 if top_r.button("🔄 Ανανέωση", use_container_width=True):
     fetch_jobs.clear()
+    st.rerun()
+if current_user and top_o.button("Αποσύνδεση", use_container_width=True):
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
     st.rerun()
 
 issues = []
